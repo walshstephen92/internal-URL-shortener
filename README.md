@@ -56,7 +56,7 @@ This would be done via a frontend web page but until that’s created, it can be
 
 Using your web browser:
 
-1.  Enter the short URL, copied in step `3.V` above.
+1.  Enter the short URL, copied in step `3.5` above.
     
 2.  You should be redirected to the original long URL.
     
