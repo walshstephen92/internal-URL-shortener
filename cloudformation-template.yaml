@@ -1,0 +1,172 @@
+Resources:
+  DynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: url_shortener
+      AttributeDefinitions:
+        - AttributeName: short_url_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: short_url_code
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+          import random
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('url_shortener')
+
+          def lambda_handler(event, context):
+            if event['httpMethod'] == 'POST':
+              # Get the long URL from the request's body
+              try:
+                original_url = json.loads(event['body'])['long_url']
+              except (json.JSONDecodeError, KeyError):
+                return {
+                  'statusCode': 400,
+                  'body': json.dumps({
+                    'error': "'long_url' needs to be given in the post request's body."
+                  })
+                }
+              
+              # Generate a 6-character alphanumeric code for the short URL
+              alphanumeric_code = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+              
+              # Store the mapping between the short URL's code and the long URL in DynamoDB
+              table.put_item(Item={
+                'short_url_code': alphanumeric_code,
+                'long_url': original_url
+              })
+              
+              # Build the full short URL from the request's host header and the short URL's code, and return it
+              return {
+                'statusCode': 200,
+                'body': json.dumps({
+                  'short_url': f"https://{event['headers']['Host']}/{event['requestContext']['stage']}/{alphanumeric_code}"
+                })
+              }
+            elif event['httpMethod'] == 'GET':
+              # Get the alphanumeric code from the short URL's path parameters
+              alphanumeric_code = event['pathParameters']['short_url_code']
+
+              # Use the short URL's code to get the item from DynamoDB that has it's mapping to the long URL
+              response = table.get_item(Key={
+                'short_url_code': alphanumeric_code
+              })
+
+              # If the long URL is found, redirect (301) to it. If not, error (404)
+              if 'Item' in response:
+                return {
+                  'statusCode': 301,
+                  'headers': {
+                    'Location': response['Item']['long_url']
+                  }
+                }
+              else:
+                return {
+                  'statusCode': 404,
+                  'body': json.dumps({
+                    'error': 'URL not found'
+                  })
+                }
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UrlShortenerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt DynamoDbTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunction
+      Principal: apigateway.amazonaws.com
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: url-shortener
+
+  ApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !GetAtt Api.RootResourceId
+      RestApiId: !Ref Api
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations"
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: "{short_url_code}"
+      RestApiId: !Ref Api
+
+  ApiGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref Api
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiPostMethod
+      - ApiGetMethod
+    Properties:
+      RestApiId: !Ref Api
+  
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref Api
+      DeploymentId: !Ref ApiDeployment
+
+Outputs:
+  ApiUrl:
+    Description: The URL for the URL Shortener API
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/"
